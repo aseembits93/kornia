@@ -28,9 +28,29 @@ from kornia.geometry.solvers import null_vector_3x4
 
 # https://github.com/opencv/opencv_contrib/blob/master/modules/sfm/src/triangulation.cpp#L68
 
-# cuSOLVER's batched symmetric eigenvalue solver crashes above this many 4x4 matrices
-# in a single call (empirically observed at >=32 K on current CUDA/PyTorch versions).
-_CUSOLVER_EIGH_BATCH_LIMIT: int = 28_000
+# cuSOLVER's batched symmetric eigenvalue solver has two limits:
+#   1. A hard API limit at ~32K matrices (CUSOLVER_STATUS_INVALID_VALUE).
+#   2. A workspace memory limit that depends on dtype and available GPU memory.
+#      For float64, the workspace is ~524 bytes per 4x4 matrix; for float32 ~262 bytes.
+#      28K float64 matrices need ~14.3 GiB workspace, which OOMs on GPUs with <=16 GiB.
+# We compute a safe chunk size dynamically from free GPU memory.
+_CUSOLVER_EIGH_HARD_LIMIT: int = 28_000
+
+
+def _eigh_chunk_size(M: torch.Tensor) -> int:
+    """Return the largest safe chunk size for batched eigh on the current device."""
+    if not M.is_cuda:
+        return _CUSOLVER_EIGH_HARD_LIMIT
+
+    free_bytes, _ = torch.cuda.mem_get_info(M.device)
+    bytes_per_elem = M.element_size()
+    k = M.shape[-1]
+    # cuSOLVER workspace is empirically ~(k^2 * 32 + 256) * bytes_per_elem per matrix.
+    # Use a conservative 0.7x safety factor to leave room for other allocations.
+    workspace_per_matrix = k * k * 32 * bytes_per_elem + 256 * bytes_per_elem
+    usable = int(free_bytes * 0.7)
+    chunk = max(1024, usable // max(workspace_per_matrix, 1))
+    return min(chunk, _CUSOLVER_EIGH_HARD_LIMIT)
 
 
 def _eigh_smallest_vec(M: torch.Tensor) -> torch.Tensor:
@@ -45,14 +65,12 @@ def _eigh_smallest_vec(M: torch.Tensor) -> torch.Tensor:
         Eigenvectors of shape ``(N, k)``.
     """
     N = M.shape[0]
-    if N <= _CUSOLVER_EIGH_BATCH_LIMIT:
+    limit = _eigh_chunk_size(M)
+    if N <= limit:
         _, V = torch.linalg.eigh(M)
         return V[..., 0]
 
-    parts = [
-        torch.linalg.eigh(M[i : i + _CUSOLVER_EIGH_BATCH_LIMIT])[1][..., 0]
-        for i in range(0, N, _CUSOLVER_EIGH_BATCH_LIMIT)
-    ]
+    parts = [torch.linalg.eigh(M[i : i + limit])[1][..., 0] for i in range(0, N, limit)]
     return torch.cat(parts, dim=0)
 
 
