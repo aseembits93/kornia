@@ -83,55 +83,59 @@ def undistort_points(
     if dist.shape[-1] < 14:
         dist = F.pad(dist, [0, 14 - dist.shape[-1]])
 
-    # Convert 2D points from pixels to normalized camera coordinates
-    cx: torch.Tensor = K[..., 0:1, 2]  # princial point in x (Bx1)
-    cy: torch.Tensor = K[..., 1:2, 2]  # princial point in y (Bx1)
-    fx: torch.Tensor = K[..., 0:1, 0]  # focal in x (Bx1)
-    fy: torch.Tensor = K[..., 1:2, 1]  # focal in y (Bx1)
+    # Extract all distortion coefficients at once to avoid repeated slicing in the loop.
+    k1 = dist[..., 0:1]
+    k2 = dist[..., 1:2]
+    p1 = dist[..., 2:3]
+    p2 = dist[..., 3:4]
+    k3 = dist[..., 4:5]
+    k4 = dist[..., 5:6]
+    k5 = dist[..., 6:7]
+    k6 = dist[..., 7:8]
+    s1 = dist[..., 8:9]
+    s2 = dist[..., 9:10]
+    s3 = dist[..., 10:11]
+    s4 = dist[..., 11:12]
 
-    # This is equivalent to K^-1 [u,v,1]^T
-    x: torch.Tensor = (points[..., 0] - cx) / fx  # (BxN - Bx1)/Bx1 -> BxN
-    y: torch.Tensor = (points[..., 1] - cy) / fy  # (BxN - Bx1)/Bx1 -> BxN
+    # Convert 2D points from pixels to normalized camera coordinates
+    cx: torch.Tensor = K[..., 0:1, 2]
+    cy: torch.Tensor = K[..., 1:2, 2]
+    fx: torch.Tensor = K[..., 0:1, 0]
+    fy: torch.Tensor = K[..., 1:2, 1]
+
+    x: torch.Tensor = (points[..., 0] - cx) / fx
+    y: torch.Tensor = (points[..., 1] - cy) / fy
 
     # Compensate for tilt distortion
     if torch.any(dist[..., 12] != 0) or torch.any(dist[..., 13] != 0):
         inv_tilt = tilt_projection(dist[..., 12], dist[..., 13], True)
-
-        # Transposed untilt points (instead of [x,y,1]^T, we obtain [x,y,1])
         x, y = transform_points(inv_tilt, torch.stack([x, y], dim=-1)).unbind(-1)
 
-    # Iteratively undistort points
+    # Iteratively undistort points — coefficients are pre-extracted to avoid
+    # repeated slicing inside the loop (saves ~10 kernel launches per iteration).
     x0, y0 = x, y
     for _ in range(num_iters):
         r2 = x * x + y * y
+        r4 = r2 * r2
 
-        inv_rad_poly = (1 + dist[..., 5:6] * r2 + dist[..., 6:7] * r2 * r2 + dist[..., 7:8] * r2**3) / (
-            1 + dist[..., 0:1] * r2 + dist[..., 1:2] * r2 * r2 + dist[..., 4:5] * r2**3
-        )
-        deltaX = (
-            2 * dist[..., 2:3] * x * y
-            + dist[..., 3:4] * (r2 + 2 * x * x)
-            + dist[..., 8:9] * r2
-            + dist[..., 9:10] * r2 * r2
-        )
-        deltaY = (
-            dist[..., 2:3] * (r2 + 2 * y * y)
-            + 2 * dist[..., 3:4] * x * y
-            + dist[..., 10:11] * r2
-            + dist[..., 11:12] * r2 * r2
-        )
+        # Horner form for radial polynomials
+        inv_num = torch.addcmul(k5, k6, r2).mul_(r2).add_(k4).mul_(r2).add_(1)
+        inv_den = torch.addcmul(k2, k3, r2).mul_(r2).add_(k1).mul_(r2).add_(1)
+        inv_rad_poly = inv_num / inv_den
+
+        xy = x * y
+        deltaX = 2 * p1 * xy + p2 * (r2 + 2 * x * x) + s1 * r2 + s2 * r4
+        deltaY = p1 * (r2 + 2 * y * y) + 2 * p2 * xy + s3 * r2 + s4 * r4
 
         x = (x0 - deltaX) * inv_rad_poly
         y = (y0 - deltaY) * inv_rad_poly
 
     # Convert points from normalized camera coordinates to pixel coordinates
-    new_cx: torch.Tensor = new_K[..., 0:1, 2]  # princial point in x (Bx1)
-    new_cy: torch.Tensor = new_K[..., 1:2, 2]  # princial point in y (Bx1)
-    new_fx: torch.Tensor = new_K[..., 0:1, 0]  # focal in x (Bx1)
-    new_fy: torch.Tensor = new_K[..., 1:2, 1]  # focal in y (Bx1)
-    x = new_fx * x + new_cx
-    y = new_fy * y + new_cy
-    return torch.stack([x, y], -1)
+    new_cx: torch.Tensor = new_K[..., 0:1, 2]
+    new_cy: torch.Tensor = new_K[..., 1:2, 2]
+    new_fx: torch.Tensor = new_K[..., 0:1, 0]
+    new_fy: torch.Tensor = new_K[..., 1:2, 1]
+    return torch.stack([new_fx * x + new_cx, new_fy * y + new_cy], -1)
 
 
 # Based on https://github.com/opencv/opencv/blob/master/modules/calib3d/src/undistort.dispatch.cpp#L287
