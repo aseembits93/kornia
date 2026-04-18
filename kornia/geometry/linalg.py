@@ -211,17 +211,44 @@ def transform_points(trans_01: torch.Tensor, points_1: torch.Tensor) -> torch.Te
 
     # We reshape to BxNxD in case we get more dimensions, e.g., MxBxNxD
     shape_inp = list(points_1.shape)
-    points_1 = points_1.reshape(-1, points_1.shape[-2], points_1.shape[-1])
+    n_points, d = points_1.shape[-2], points_1.shape[-1]
+    points_1 = points_1.reshape(-1, n_points, d)
     trans_01 = trans_01.reshape(-1, trans_01.shape[-2], trans_01.shape[-1])
     # We expand trans_01 to match the dimensions needed for bmm. repeats input division is cast
     # to integer so onnx doesn't record the value as a tensor and get a device mismatch
     trans_01 = torch.repeat_interleave(trans_01, repeats=int(points_1.shape[0] // trans_01.shape[0]), dim=0)
-    # to homogeneous
-    points_1_h = convert_points_to_homogeneous(points_1)  # BxNxD+1
-    # transform coordinates
-    points_0_h = torch.bmm(points_1_h, trans_01.permute(0, 2, 1))
-    # to euclidean
-    points_0 = convert_points_from_homogeneous(points_0_h)  # BxNxD
+
+    n_rows = trans_01.shape[-2]  # D+1 for square, D for non-square (e.g. 3x4 projection)
+
+    if n_rows == d + 1:
+        # Square (D+1)x(D+1) transform (rigid, affine, or projective).
+        # Decompose into affine (R, t) and perspective (w_row, w_last) parts.
+        # Instead of padding points to D+1, doing a full (D+1)x(D+1) bmm, then
+        # converting back from homogeneous (abs + where + div + slice), we do
+        # a smaller DxD bmm + add for the affine part and a cheap dot + scalar
+        # for the perspective w.
+        R = trans_01[:, :d, :d]  # BxDxD
+        t = trans_01[:, :d, d]  # BxD
+
+        # Affine part: points @ R^T + t
+        points_0 = torch.bmm(points_1, R.transpose(-1, -2)) + t[:, None, :]
+
+        # Perspective w: w = points @ w_row^T + w_last.
+        # For affine transforms (last row = [0,...,0,1]) this evaluates to 1
+        # everywhere. We always compute it to keep gradients flowing through
+        # the last row of the transform — needed for torch.autograd.gradcheck.
+        w_row = trans_01[:, d, :d]  # BxD
+        w_last = trans_01[:, d, d]  # B
+        w = torch.bmm(points_1, w_row[:, :, None]).squeeze(-1) + w_last[:, None]  # BxN
+        safe_w = torch.where(w.abs() > 1e-8, w, torch.ones_like(w))
+        points_0 = points_0 / safe_w.unsqueeze(-1)
+    else:
+        # Non-square Dx(D+1) matrix (e.g. 3x4 projection): must use
+        # the full homogeneous path because the output dimension differs.
+        points_1_h = convert_points_to_homogeneous(points_1)
+        points_0_h = torch.bmm(points_1_h, trans_01.permute(0, 2, 1))
+        points_0 = convert_points_from_homogeneous(points_0_h)
+
     # reshape to the input shape
     shape_inp[-2] = points_0.shape[-2]
     shape_inp[-1] = points_0.shape[-1]
