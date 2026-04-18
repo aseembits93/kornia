@@ -921,19 +921,13 @@ def normalize_pixel_coordinates(
     if pixel_coordinates.shape[-1] != 2:
         raise ValueError(f"Input pixel_coordinates must be of shape (*, 2). Got {pixel_coordinates.shape}")
 
-    # compute normalization factor
-    hw: torch.Tensor = torch.stack(
-        [
-            torch.tensor(width, device=pixel_coordinates.device, dtype=pixel_coordinates.dtype),
-            torch.tensor(height, device=pixel_coordinates.device, dtype=pixel_coordinates.dtype),
-        ]
-    )
+    # Compute normalization: result = 2 * coords / (dim - 1) - 1
+    # Use Python scalars for factor to avoid creating intermediate GPU tensors.
+    factor_w = 2.0 / max(width - 1, eps)
+    factor_h = 2.0 / max(height - 1, eps)
+    factor = torch.tensor([factor_w, factor_h], device=pixel_coordinates.device, dtype=pixel_coordinates.dtype)
 
-    factor: torch.Tensor = torch.tensor(2.0, device=pixel_coordinates.device, dtype=pixel_coordinates.dtype) / (
-        hw - 1
-    ).clamp(eps)
-
-    return factor * pixel_coordinates - 1
+    return pixel_coordinates * factor - 1
 
 
 def denormalize_pixel_coordinates(
@@ -960,16 +954,12 @@ def denormalize_pixel_coordinates(
     """
     if pixel_coordinates.shape[-1] != 2:
         raise ValueError(f"Input pixel_coordinates must be of shape (*, 2). Got {pixel_coordinates.shape}")
-    # compute normalization factor
-    hw: torch.Tensor = (
-        torch.stack([torch.tensor(width), torch.tensor(height)])
-        .to(pixel_coordinates.device)
-        .to(pixel_coordinates.dtype)
-    )
+    # Use Python scalars for the inverse factor to avoid creating intermediate GPU tensors.
+    factor_w = max(width - 1, eps) / 2.0
+    factor_h = max(height - 1, eps) / 2.0
+    factor = torch.tensor([factor_w, factor_h], device=pixel_coordinates.device, dtype=pixel_coordinates.dtype)
 
-    factor: torch.Tensor = torch.tensor(2.0) / (hw - 1).clamp(eps)
-
-    return torch.tensor(1.0) / factor * (pixel_coordinates + 1)
+    return (pixel_coordinates + 1) * factor
 
 
 def normalize_pixel_coordinates3d(

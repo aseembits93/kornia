@@ -222,27 +222,26 @@ def transform_points(trans_01: torch.Tensor, points_1: torch.Tensor) -> torch.Te
 
     if n_rows == d + 1:
         # Square (D+1)x(D+1) transform (rigid, affine, or projective).
-        # Decompose into affine (R, t) and perspective (last row) parts.
+        # Decompose into affine (R, t) and perspective (w_row, w_last) parts.
         # Instead of padding points to D+1, doing a full (D+1)x(D+1) bmm, then
-        # converting back from homogeneous, we do a smaller DxD bmm + add.
+        # converting back from homogeneous (abs + where + div + slice), we do
+        # a smaller DxD bmm + add for the affine part and a cheap dot + scalar
+        # for the perspective w.
         R = trans_01[:, :d, :d]  # BxDxD
         t = trans_01[:, :d, d]  # BxD
 
         # Affine part: points @ R^T + t
         points_0 = torch.bmm(points_1, R.transpose(-1, -2)) + t[:, None, :]
 
-        # Perspective division: only needed when the last row is not [0,...,0,1].
-        # Small CPU transfer (D+1 elements) to avoid launching GPU kernels for
-        # the common affine case.
-        last_row = trans_01[0, d, :].detach().cpu()
-        needs_perspective = not (torch.all(last_row[:d] == 0) and last_row[d] == 1)
-        if needs_perspective:
-            w_row = trans_01[:, d, :d]
-            w_last = trans_01[:, d, d]
-            w = torch.bmm(points_1, w_row[:, :, None]).squeeze(-1) + w_last[:, None]
-            mask = torch.abs(w) > 1e-8
-            scale = torch.where(mask, 1.0 / (w + 1e-8), torch.ones_like(w))
-            points_0 = points_0 * scale.unsqueeze(-1)
+        # Perspective w: w = points @ w_row^T + w_last.
+        # For affine transforms (last row = [0,...,0,1]) this evaluates to 1
+        # everywhere. We always compute it to keep gradients flowing through
+        # the last row of the transform — needed for torch.autograd.gradcheck.
+        w_row = trans_01[:, d, :d]  # BxD
+        w_last = trans_01[:, d, d]  # B
+        w = torch.bmm(points_1, w_row[:, :, None]).squeeze(-1) + w_last[:, None]  # BxN
+        safe_w = torch.where(w.abs() > 1e-8, w, torch.ones_like(w))
+        points_0 = points_0 / safe_w.unsqueeze(-1)
     else:
         # Non-square Dx(D+1) matrix (e.g. 3x4 projection): must use
         # the full homogeneous path because the output dimension differs.
